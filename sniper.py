@@ -269,7 +269,7 @@ if 'last_results' in st.session_state:
                     st.caption(existing_audit.get('reasoning'))
                 else:
                     # Show button
-                    if st.button("🧠 Audit Risk", key=f"btn_{slug}"):
+                    if st.button("🧠 Audit Risk", key=f"btn_{slug}_{i}"):
                         # Perform Audit
                         with st.spinner("Analyzing..."):
                             analyze_risk_llm(row['Question'], row['Event'], slug)
