@@ -1,278 +1,168 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, timezone
-import json
-import time
+import re
+from urllib.parse import urlparse
 
 # --- CONFIGURATION ---
 POLY_URL = "https://gamma-api.polymarket.com/events"
-TAGS_URL = "https://gamma-api.polymarket.com/tags"
+st.set_page_config(page_title="PolySource Scout", layout="wide", page_icon="🔍")
 
-# --- LOCAL/CLOUD API KEY HANDLING ---
-# Try to get key from secrets (Cloud), else use a placeholder or input (Local)
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
-
-st.set_page_config(page_title="PolySniper Pro", layout="wide", page_icon="🎯")
-
-# --- SESSION STATE SETUP (Fix for Button Bug) ---
-if 'audits' not in st.session_state:
-    st.session_state['audits'] = {} # Stores audit results: {slug: {verdict:..., risk:...}}
-
-# --- MODELS ---
-MODEL_FALLBACK_LIST = [
-    "qwen/qwen3-coder:free",
-    "google/gemini-2.0-flash-exp:free",
-    "kwaipilot/kat-coder-pro:free",
-    "deepseek/deepseek-r1-0528:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "deepseek/deepseek-r1:free",
-    "tngtech/deepseek-r1t2-chimera:free",
-    "tngtech/deepseek-r1t-chimera:free",
-    "microsoft/mai-ds-r1:free",
-    "deepseek/deepseek-chat-v3.1:free",
-    "openai/gpt-oss-20b:free",
-    "mistralai/mistral-small-3.2-24b-instruct:free",
-    "mistralai/mistral-nemo:free",
-    "google/gemma-3-27b-it:free",
-    "z-ai/glm-4.5-air:free",
-    "deepseek/deepseek-r1-0528-qwen3-8b:free",
-    "alibaba/tongyi-deepresearch-30b-a3b:free",
-    "meituan/longcat-flash-chat:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "meta-llama/llama-3.3-8b-instruct:free",
-    "meta-llama/llama-4-maverick:free",
-    "meta-llama/llama-4-scout:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "agentica-org/deepcoder-14b-preview:free",
-    "qwen/qwen3-4b:free",
-    "qwen/qwen3-30b-a3b:free",
-    "qwen/qwen3-14b:free",
-    "qwen/qwen3-235b-a22b:free",
-    "moonshotai/kimi-k2:free",
-    "mistralai/mistral-small-24b-instruct-2501:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-coder-32b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemma-3-4b-it:free",
-    "google/gemma-3-12b-it:free",
-    "qwen/qwen2.5-vl-32b-instruct:free",
-    "google/gemma-3n-e2b-it:free",
-    "google/gemma-3n-e4b-it:free",
-    "deepseek/deepseek-r1-distill-llama-70b:free"
-]
-
-# --- CUSTOM CSS ---
+# --- CSS FOR CLEAN LOOK ---
 st.markdown("""
     <style>
-    .stApp { background-color: #0e1117; color: #e0e0e0; }
-    .stButton>button { border: 1px solid #30363d; background-color: #21262d; color: #58a6ff; }
-    .stButton>button:hover { border-color: #58a6ff; color: #ffffff; }
-    .risk-badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; }
-    .risk-safe { background-color: #238636; color: white; }
-    .risk-high { background-color: #da3633; color: white; }
+    .stApp { background-color: #0e1117; color: #c9d1d9; }
+    .source-tag { 
+        background-color: #238636; 
+        color: white; 
+        padding: 2px 8px; 
+        border-radius: 10px; 
+        font-size: 0.8em;
+    }
+    .category-tag {
+        border: 1px solid #30363d;
+        color: #58a6ff;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.8em;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# --- FUNCTIONS ---
-
-@st.cache_data(ttl=3600)
-def fetch_tags():
-    """Fetches all available tags from Polymarket for the dropdown."""
-    try:
-        r = requests.get(TAGS_URL)
-        if r.status_code == 200:
-            tags = r.json()
-            # Return a dictionary {Name: ID}
-            return {t['label']: t['id'] for t in tags if 'label' in t}
-    except:
-        pass
-    return {}
-
-def analyze_risk_llm(question, event_title, slug):
-    """The AI Auditor Logic"""
-    current_time = datetime.now().isoformat()
-    
-    system_prompt = f"""You are Synapse, a ruthless trade auditor.
-    Current time: {current_time}.
-    
-    Audit this Polymarket event for "Manipulation Risk" and "Ambiguity".
-    Event: {event_title}
-    Market: {question}
-    
-    Output ONLY a JSON object:
-    {{
-        "risk_score": (Integer 1-10, 10=EXTREME RISK),
-        "verdict": "SAFE" or "RISKY",
-        "reasoning": "One sharp sentence explaining why."
-    }}
+# --- LOGIC: EXTRACT DOMAIN FROM DESCRIPTION ---
+def extract_source(description):
     """
+    Scans the market description to find the first Link.
+    Usually the first link is the Resolution Source.
+    """
+    if not description:
+        return "Unknown"
     
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://polysniper.streamlit.app",
-    }
+    # Regex to find http/https links
+    urls = re.findall(r'(https?://[^\s\)]+)', description)
+    
+    if urls:
+        # Get the domain (e.g., 'www.boxofficemojo.com')
+        domain = urlparse(urls[0]).netloc
+        return domain.replace('www.', '')
+    
+    return "No Link / General Knowledge"
 
-    for model in MODEL_FALLBACK_LIST:
-        try:
-            payload = {
-                "model": model,
-                "messages": [{"role": "system", "content": system_prompt}]
-            }
-            r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15)
-            
-            if r.status_code == 200:
-                content = r.json()['choices'][0]['message']['content']
-                # Clean JSON
-                if "```json" in content: content = content.split("```json")[1].split("```")[0]
-                elif "```" in content: content = content.split("```")[1].split("```")[0]
-                
-                result = json.loads(content)
-                # Store in Session State immediately
-                st.session_state['audits'][slug] = result
-                return result
-        except:
-            continue
-            
-    return {"risk_score": 0, "verdict": "ERROR", "reasoning": "AI unavailable."}
-
-@st.cache_data(ttl=120)
-def fetch_markets_advanced(pages=3, tag_id=None):
-    """Fetches markets with optional Tag Filtering."""
-    all_items = []
+# --- FETCH FUNCTION ---
+@st.cache_data(ttl=600)
+def fetch_source_markets(pages=4):
+    all_data = []
+    bar = st.progress(0, text="Scanning Resolution Sources...")
     
     for page in range(pages):
-        offset = page * 50
         params = {
-            "closed": "false",
-            "limit": 50,
-            "offset": offset,
-            "order": "id",
+            "closed": "false", 
+            "limit": 50, 
+            "offset": page*50, 
+            "order": "volume", # Get high volume/popular ones first
             "ascending": "false"
         }
-        if tag_id:
-            params["tag_id"] = tag_id
-            
+        
         try:
             r = requests.get(POLY_URL, params=params)
             if not r.ok: break
-            data = r.json()
-            if not data: break
+            events = r.json()
+            if not events: break
             
-            for event in data:
-                markets = event.get('markets', [])
-                for m in markets:
-                    # Calculate Spread/Price Sum
-                    prices = json.loads(m.get('outcomePrices', '[]')) if isinstance(m.get('outcomePrices'), str) else m.get('outcomePrices', [])
-                    # Simple check for Yes/No spread (assuming 2 outcomes)
-                    price_sum = 0
-                    try:
-                        price_sum = sum([float(p) for p in prices]) if prices else 0
-                    except: price_sum = 0
-                    
-                    all_items.append({
-                        "Event": event.get('title'),
-                        "Question": m.get('question'),
-                        "Slug": event.get('slug'),
-                        "Volume": float(m.get('volume', 0)),
-                        "Liquidity": float(m.get('liquidity', 0)), # Gamma API sometimes has this
-                        "EndDate": m.get('endDate'),
-                        "PriceSum": price_sum, # 1.0 is perfect, >1.0 is fee, <1.0 is arb
-                        "Outcomes": m.get('outcomes')
+            for e in events:
+                # 1. Get Category (First Tag)
+                tags = e.get('tags', [])
+                category = tags[0]['label'] if tags else "Uncategorized"
+                
+                # 2. Extract Source Domain
+                desc = e.get('description', '')
+                source_domain = extract_source(desc)
+                
+                # 3. Market Info
+                # Check markets inside event
+                markets = e.get('markets', [])
+                if markets:
+                    m = markets[0] # Take the main market
+                    all_data.append({
+                        "Event": e.get('title'),
+                        "Category": category,
+                        "Source": source_domain,
+                        "Volume": m.get('volume', 0),
+                        "Slug": e.get('slug'),
+                        "Description": desc
                     })
-        except Exception as e:
-            st.error(f"API Error: {e}")
+                    
+        except Exception as err:
+            st.error(f"Error: {err}")
             break
-    
-    return pd.DataFrame(all_items)
+            
+        bar.progress((page + 1) / pages)
+        
+    bar.empty()
+    return pd.DataFrame(all_data)
 
-# --- SIDEBAR CONFIG ---
-st.sidebar.title("🎯 Sniper Config")
-
-# Tag Filter
-tag_map = fetch_tags()
-selected_tag_label = st.sidebar.selectbox("Filter by Category", ["All Markets"] + list(tag_map.keys()))
-selected_tag_id = tag_map.get(selected_tag_label) if selected_tag_label != "All Markets" else None
-
-days_left_max = st.sidebar.slider("Ends within (Days)", 0.5, 30.0, 5.0)
-min_volume = st.sidebar.number_input("Min Volume ($)", 5000, 10000000, 10000)
+# --- SIDEBAR ---
+st.sidebar.title("🔍 Source Scout")
 scan_depth = st.sidebar.slider("Scan Depth (Pages)", 1, 10, 3)
+st.sidebar.divider()
+
+# Filter by Category
+target_category = st.sidebar.text_input("Filter Category (e.g. Economy, Pop)", "")
+# Filter by Source
+target_source = st.sidebar.text_input("Filter Source (e.g. twitter, bls.gov)", "")
 
 # --- MAIN UI ---
-st.title("PolySniper Pro ⚡")
-st.caption(f"Targeting: {selected_tag_label} | Vol > ${min_volume:,.0f} | < {days_left_max} Days")
+st.title("Polymarket Resolution Sources")
+st.caption("Scanning events to see WHO decides the winner.")
 
-if st.button("RUN DEEP SCAN"):
-    with st.spinner("Scanning Order Books..."):
-        df = fetch_markets_advanced(scan_depth, selected_tag_id)
-        
-        if not df.empty:
-            # Date Math
-            df['EndDate'] = pd.to_datetime(df['EndDate']).dt.tz_convert(None)
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            df['DaysLeft'] = (df['EndDate'] - now).dt.total_seconds() / 86400
-            
-            # Filtering
-            mask = (df['DaysLeft'] > 0) & (df['DaysLeft'] <= days_left_max) & (df['Volume'] >= min_volume)
-            filtered = df[mask].copy()
-            
-            # Action Density (Vol / Time)
-            filtered['ActionDensity'] = filtered['Volume'] / filtered['DaysLeft'].clip(lower=0.1)
-            filtered = filtered.sort_values(by='ActionDensity', ascending=False)
-            
-            st.session_state['last_results'] = filtered # Save results so they stay after buttons click
-        else:
-            st.warning("No markets found.")
-
-# --- RENDER RESULTS (From Session State) ---
-if 'last_results' in st.session_state:
-    results = st.session_state['last_results']
-    st.success(f"Displaying {len(results)} Opportunities")
+if st.button("SCAN SOURCES"):
+    df = fetch_source_markets(scan_depth)
     
-    for i, row in results.iterrows():
-        slug = row['Slug']
-        
-        with st.container():
-            c1, c2, c3 = st.columns([3, 1, 1])
+    if not df.empty:
+        # --- FILTERING ---
+        if target_category:
+            df = df[df['Category'].str.contains(target_category, case=False, na=False)]
+        if target_source:
+            df = df[df['Source'].str.contains(target_source, case=False, na=False)]
             
-            with c1:
-                st.subheader(row['Question'])
-                st.caption(f"Event: {row['Event']}")
-                st.markdown(f"[Trade on Polymarket](https://polymarket.com/event/{slug})", unsafe_allow_html=True)
-                
-                # SPREAD WARNING
-                if row['PriceSum'] > 1.02:
-                    st.warning(f"⚠️ High Spread/Fees (Sum: {row['PriceSum']:.2f})")
-                elif row['PriceSum'] < 0.98 and row['PriceSum'] > 0:
-                    st.info(f"💎 Arbitrage Chance? (Sum: {row['PriceSum']:.2f})")
+        # --- STATISTICS ---
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Total Markets", len(df))
+        with c2:
+            top_cat = df['Category'].mode()[0] if not df.empty else "N/A"
+            st.metric("Top Category", top_cat)
+        with c3:
+            top_source = df['Source'].mode()[0] if not df.empty else "N/A"
+            st.metric("Most Common Source", top_source)
+            
+        st.divider()
 
-            with c2:
-                st.metric("Volume", f"${row['Volume']:,.0f}")
-                st.metric("Ends In", f"{row['DaysLeft']:.1f}d")
-                
-            with c3:
-                # AUDIT LOGIC
-                # Check if we already have an audit for this slug
-                existing_audit = st.session_state['audits'].get(slug)
-                
-                if existing_audit:
-                    # Show cached result
-                    score = existing_audit.get('risk_score')
-                    verdict = existing_audit.get('verdict')
-                    color = "red" if verdict == "RISKY" else "green"
-                    st.markdown(f":{color}-background[**{verdict} ({score}/10)**]")
-                    st.caption(existing_audit.get('reasoning'))
-                else:
-                    # Show button
-                    if st.button("🧠 Audit Risk", key=f"btn_{slug}_{i}"):
-                        # Perform Audit
-                        with st.spinner("Analyzing..."):
-                            analyze_risk_llm(row['Question'], row['Event'], slug)
-                        st.rerun() # Refresh to show the result immediately
-            
-            st.divider()
+        # --- DISPLAY AS INTERACTIVE TABLE ---
+        # Convert volume to numeric for sorting
+        df['Volume'] = pd.to_numeric(df['Volume'])
+        
+        # Configure the Dataframe display
+        st.dataframe(
+            df[['Category', 'Source', 'Event', 'Volume']],
+            column_config={
+                "Category": st.column_config.TextColumn("Category", help="Market Type"),
+                "Source": st.column_config.TextColumn("Resolution Source", width="medium"),
+                "Event": st.column_config.TextColumn("Event Name", width="large"),
+                "Volume": st.column_config.NumberColumn("Volume", format="$%d"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=600
+        )
+        
+        # --- RAW LIST VIEW (For clicking) ---
+        st.subheader("Direct Links")
+        for i, row in df.iterrows():
+            with st.expander(f"{row['Category']} | {row['Source']} | {row['Event']}"):
+                st.write(f"**Resolution Source:** {row['Source']}")
+                st.markdown(f"[Go to Market](https://polymarket.com/event/{row['Slug']})")
+                st.info(f"**Full Context:** {row['Description'][:300]}...")
+
+    else:
+        st.warning("No data found.")
